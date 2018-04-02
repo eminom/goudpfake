@@ -1,15 +1,21 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
+	"time"
 )
 
 var (
-	fHop = flag.String("hop", "183.230.40.40:5683", "next hop for fake-proxy")
+	fHop  = flag.String("hop", "183.230.40.40:5683", "next hop for fake-proxy")
+	fAddr = flag.String("addr", "127.0.0.1:5683", "local address")
 )
 
 type Ele struct {
@@ -47,7 +53,7 @@ func NewFakeRouter(realAddr string, writeBack func([]byte, *net.UDPAddr) (int, e
 	}
 }
 
-func (fr *FakeRouter) CheckAndCreate(esteCltAddr *net.UDPAddr) (chan []byte, bool) {
+func (fr *FakeRouter) CheckAndCreate(esteCltAddr *net.UDPAddr, wg *sync.WaitGroup, ctx context.Context) (chan []byte, bool) {
 	fr.esteLock.Lock()
 	defer fr.esteLock.Unlock()
 
@@ -83,22 +89,29 @@ func (fr *FakeRouter) CheckAndCreate(esteCltAddr *net.UDPAddr) (chan []byte, boo
 		upLink := ele.oChan
 
 		downLink := make(chan []byte, 1)
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			buff := make([]byte, 16*1024)
 			for {
+				esteConn.SetReadDeadline(time.Now().Add(1 * time.Second))
 				read, rAddr, err := esteConn.ReadFromUDP(buff)
-				if err != nil {
-					continue
-				}
-				if rAddr.String() == realHost.String() {
-					downLink <- dupBuffer(buff[:read])
+				if err == nil {
+					if rAddr.String() == realHost.String() {
+						downLink <- dupBuffer(buff[:read])
+					}
+				} else {
 				}
 			}
 		}()
 
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			for {
 				select {
+				case <-ctx.Done():
+					return
 				case inBuff := <-upLink: // from client
 					//log.Printf("relay up-link")
 					written, ok := esteConn.WriteToUDP(inBuff, realHost)
@@ -116,10 +129,14 @@ func (fr *FakeRouter) CheckAndCreate(esteCltAddr *net.UDPAddr) (chan []byte, boo
 	return rv.oChan, ok
 }
 
+func init() {
+	flag.Parse()
+}
+
 func main() {
 	log.SetFlags(log.Lshortfile)
 
-	addr, err := net.ResolveUDPAddr("udp4", "127.0.0.1:5683")
+	addr, err := net.ResolveUDPAddr("udp4", *fAddr)
 	if err != nil {
 		log.Fatalf("resolve addr error: %v", err)
 	}
@@ -143,16 +160,36 @@ func main() {
 
 	thisFR := NewFakeRouter(*fHop, writeFunc)
 	buffer := make([]byte, 1024*1024)
-	for {
-		read, rAddr, err := sock.ReadFromUDP(buffer)
-		if err != nil {
-			//TODO: Fixme
-			log.Fatalf("read error: %v", err)
-		}
-		oChan, ok := thisFR.CheckAndCreate(rAddr)
-		if ok {
-			oChan <- dupBuffer(buffer[:read])
-		}
-	}
 
+	var wg sync.WaitGroup
+
+	ctx, doCancel := context.WithCancel(context.Background())
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			read, rAddr, err := sock.ReadFromUDP(buffer)
+			if nil == err {
+				oChan, ok := thisFR.CheckAndCreate(rAddr, &wg, ctx)
+				if ok {
+					oChan <- dupBuffer(buffer[:read])
+				}
+			} else {
+				log.Printf("read: %v", err)
+			}
+			select {
+			case _ = <-ctx.Done():
+				return
+			default:
+			}
+
+		}
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, os.Kill, syscall.SIGTERM)
+	<-sigCh
+	doCancel()
+	wg.Wait()
+	log.Printf("bye")
 }
