@@ -91,7 +91,10 @@ func (fr *FakeRouter) CheckAndCreate(esteCltAddr *net.UDPAddr, wg *sync.WaitGrou
 		downLink := make(chan []byte, 1)
 		wg.Add(1)
 		go func() {
-			defer wg.Done()
+			defer func() {
+				log.Printf("leavin read for <%v>", a)
+				wg.Done()
+			}()
 			buff := make([]byte, 16*1024)
 			for {
 				esteConn.SetReadDeadline(time.Now().Add(1 * time.Second))
@@ -100,14 +103,26 @@ func (fr *FakeRouter) CheckAndCreate(esteCltAddr *net.UDPAddr, wg *sync.WaitGrou
 					if rAddr.String() == realHost.String() {
 						downLink <- dupBuffer(buff[:read])
 					}
+				} else if nErr, ok := err.(*net.OpError); ok && nErr.Timeout() {
+					//As expected.
+
 				} else {
+					log.Printf("error: %T: %v", err, err)
+				}
+				select {
+				case <-ctx.Done():
+					return
+				default:
 				}
 			}
 		}()
 
 		wg.Add(1)
 		go func() {
-			defer wg.Done()
+			defer func() {
+				log.Printf("leavin for switch <%v>", a)
+				wg.Done()
+			}()
 			for {
 				select {
 				case <-ctx.Done():
@@ -166,17 +181,24 @@ func main() {
 	ctx, doCancel := context.WithCancel(context.Background())
 	wg.Add(1)
 	go func() {
-		defer wg.Done()
+		defer func() {
+			log.Printf("leavin master read")
+			wg.Done()
+		}()
 		for {
+			sock.SetReadDeadline(time.Now().Add(1 * time.Second))
 			read, rAddr, err := sock.ReadFromUDP(buffer)
 			if nil == err {
 				oChan, ok := thisFR.CheckAndCreate(rAddr, &wg, ctx)
 				if ok {
 					oChan <- dupBuffer(buffer[:read])
 				}
+			} else if nErr, ok := err.(*net.OpError); ok && nErr.Timeout() {
+				//As expected.
 			} else {
-				log.Printf("read: %v", err)
+				log.Printf("read: %T:%v", err, err)
 			}
+
 			select {
 			case _ = <-ctx.Done():
 				return
@@ -189,6 +211,7 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, os.Kill, syscall.SIGTERM)
 	<-sigCh
+	log.Print("quitting")
 	doCancel()
 	wg.Wait()
 	log.Printf("bye")
