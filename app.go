@@ -33,7 +33,7 @@ func dupBuffer(buffer []byte) []byte {
 
 func NewFakeRouter(realAddr string, writeBack func([]byte, *net.UDPAddr) (int, error)) *FakeRouter {
 
-	rAdd, err := net.ResolveUDPAddr("UDP4", realAddr)
+	rAdd, err := net.ResolveUDPAddr("udp4", realAddr)
 	if err != nil {
 		log.Fatalf("error resolve real addr: %v", realAddr)
 	}
@@ -47,27 +47,29 @@ func NewFakeRouter(realAddr string, writeBack func([]byte, *net.UDPAddr) (int, e
 	}
 }
 
-func (fr *FakeRouter) CheckAndCreate(a string) (chan []byte, bool) {
+func (fr *FakeRouter) CheckAndCreate(esteCltAddr *net.UDPAddr) (chan []byte, bool) {
 	fr.esteLock.Lock()
 	defer fr.esteLock.Unlock()
+
+	a := esteCltAddr.String()
 	_, ok := fr.thisMap[a]
-	esteCltAddr, err := net.ResolveUDPAddr("UDP4", a)
-	if err != nil {
-		log.Fatalf("client addr resolving: %v", err)
-	}
+
 	if !ok {
+
+		log.Printf("creatin' proxy for %v", esteCltAddr)
 		ele := &Ele{
 			oChan: make(chan []byte),
 		}
+		fr.thisMap[a] = *ele
 
 		var portUsed = fr.localPort
 		var esteConn *net.UDPConn
 		for p := fr.localPort; ; p++ {
-			lAddr, err := net.ResolveUDPAddr("UDP4", fmt.Sprintf(":%v", p))
+			lAddr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf(":%v", p))
 			if err != nil {
 				log.Fatalf("resolve error: %v", err)
 			}
-			pConn, err := net.ListenUDP("UDP4", lAddr)
+			pConn, err := net.ListenUDP("udp4", lAddr)
 			if err == nil {
 				log.Printf("%d is taken now", p)
 				portUsed = p
@@ -98,8 +100,12 @@ func (fr *FakeRouter) CheckAndCreate(a string) (chan []byte, bool) {
 			for {
 				select {
 				case inBuff := <-upLink: // from client
-					written, err := esteConn.WriteToUDP(inBuff, realHost)
+					//log.Printf("relay up-link")
+					written, ok := esteConn.WriteToUDP(inBuff, realHost)
+					_ = written
+					_ = ok
 				case buff := <-downLink:
+					//log.Printf("relay down-link")
 					fr.writeBack(buff, esteCltAddr)
 				}
 			}
@@ -113,7 +119,7 @@ func (fr *FakeRouter) CheckAndCreate(a string) (chan []byte, bool) {
 func main() {
 	log.SetFlags(log.Lshortfile)
 
-	addr, err := net.ResolveUDPAddr("udp4", ":5683")
+	addr, err := net.ResolveUDPAddr("udp4", "127.0.0.1:5683")
 	if err != nil {
 		log.Fatalf("resolve addr error: %v", err)
 	}
@@ -123,6 +129,8 @@ func main() {
 		log.Fatalf("listen error: %v", err)
 	}
 	defer sock.Close()
+
+	log.Printf("listening on %v", addr)
 
 	var wrLock sync.Mutex
 
@@ -141,11 +149,9 @@ func main() {
 			//TODO: Fixme
 			log.Fatalf("read error: %v", err)
 		}
-		oChan, ok := thisFR.CheckAndCreate(rAddr.String())
+		oChan, ok := thisFR.CheckAndCreate(rAddr)
 		if ok {
-			obuff := make([]byte, read)
-			copy(obuff, buffer)
-			oChan <- obuff
+			oChan <- dupBuffer(buffer[:read])
 		}
 	}
 
